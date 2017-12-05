@@ -1,0 +1,6 @@
+sequential: 2.1e-05
+parallel: 0.000617
+id: 0	visits: 5
+id: 2	visits: 0
+id: 3	visits: 0
+id: 1	visits: 0

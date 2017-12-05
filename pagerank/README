@@ -1,0 +1,2 @@
+compile: mpic++ pagerank.cpp -o pagerank
+execute: mpirun -machinefile <file_name> -np <#> pagerank <input_file>

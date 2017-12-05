@@ -1,0 +1,286 @@
+#include <unistd.h>
+#include <fcntl.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <mpi.h>
+
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include <vector>
+#include <string>
+#include <iostream>
+#include <map>
+#include <utility>
+
+using namespace std;
+
+void distribute_data(int, int, char**);
+void print_arrays(int, unsigned int);
+void add_connections(unsigned int , int , unsigned int, char*);
+int get_lines(char *, long, unsigned int[]);
+
+unsigned int num_nodes, nodes_per_proc;
+
+vector< vector <unsigned int> > connect_to;
+vector <unsigned int> send_data;
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        printf("Usage: mpirun -machinefile <filename>"
+               "-np <# of procs> <name of input file>\n");
+        return 1;
+    }
+
+    int numprocs, rank;
+
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    unsigned int i;
+
+    /* parse the input file and get the initial data to everyone */
+    if (rank == 0) {
+        distribute_data(numprocs, rank, argv);
+        print_arrays(rank, nodes_per_proc);
+    }
+    
+    else {
+        /* get number of nodes from proc0 (through bcast) */
+        MPI_Bcast(&num_nodes, 1, MPI_UNSIGNED, 0, MPI_COMM_WORLD);
+        // printf("p%d nodes: %d\n", rank, num_nodes);
+        nodes_per_proc = num_nodes / numprocs;
+        
+        connect_to.resize(nodes_per_proc);
+        /* receive the node information */
+        MPI_Status status;
+        unsigned int connections;
+
+        unsigned int n;
+        for (n=0; n<nodes_per_proc; n++) {
+            MPI_Recv(&connections, 1, MPI_UNSIGNED, 0, MPI_ANY_TAG,
+                     MPI_COMM_WORLD, &status);
+
+            if (connections == (num_nodes+1))
+                break;
+            // if (n==nodes_per_proc-1)
+            //     printf("p%d connections: %d\n", rank, connections);
+            unsigned int data[connections];
+            MPI_Recv(&data, connections, MPI_INT, 0, MPI_ANY_TAG,
+                     MPI_COMM_WORLD, &status);
+
+            for (i=0; i<connections; i++) printf("%d %d\n", i, data[i]);
+            
+            /* move the data array into a 2-D array */
+            for (i=0; i<(unsigned int)data[0]+1; i++) 
+                connect_to[n].push_back(data[i]);
+
+        }
+        print_arrays(rank, nodes_per_proc);
+    }
+    // dictionary[node_id, list of nodes who point to it] 
+    map<int, vector<int> > num_connected;
+
+    unsigned int j;
+    /* get total number of connections for each node
+     * and find any connections in the local data */
+    // for (i=0; i<nodes_per_proc; i++) {
+    //     unsigned int node_id = i + (rank * nodes_per_proc);
+    //     for (j=1; j<connect_to[i][0]+1; j++) {
+    //         if (num_connected.find(node_id) == num_connected.end()) {
+    //             num_connected[node_id].resize(1);
+    //             num_connected[node_id].push_back(connect_to[i][j]);
+    //         }
+    //     }
+    // }
+
+
+    // for (map<int, vector<int> >::iterator ii=num_connected.begin(); 
+    //      ii!=num_connected.end(); ++ii) {
+    //     cout << (*ii).first << ":";
+    //     for (vector<int>::iterator vi=(*ii).second.begin();
+    //          vi!=(*ii).second.end(); ++vi) 
+    //         cout << " " << *vi;
+    //     cout << endl;
+    // }
+    // for (j=0; j<nodes_per_proc; j++)
+    //     free(connect_to[j]);
+    // free(connect_to);
+
+    printf("FIN::%d\n",rank);
+    MPI_Finalize();
+
+    return 0;
+}
+/* read the file
+ * chop it into chunnks
+ * send to the rest of the processors
+ */
+void distribute_data(int numprocs, int rank, char *argv[]) {
+    int fd=0;
+    if ((fd=open(argv[1], O_RDONLY)) < 0) {
+        printf("Error in opening the file!\n");
+        exit(1);
+    }
+    struct stat fileStat;
+    if (fstat(fd, &fileStat) < 0) {
+        printf("Error getting fstat!\n");
+        exit(1);
+    }
+    long i;
+    long nbytes = fileStat.st_size;
+    char *file = (char *)malloc(sizeof(char) * nbytes);
+
+    read(fd, file, nbytes);
+
+    /* get the number of nodes in this graph */
+    char *nodes;
+    nodes = strstr(file, "Nodes: ");
+    nodes+=7;
+
+    int start=0;
+    i=0;
+    while (nodes[i++] != ' ') start++;
+    string num_nodes_str(nodes, start);
+    // cout << "num_nodes: [" << num_nodes_str << "]\n";
+    num_nodes = atoi(num_nodes_str.c_str());
+
+    /* tell everyone how many nodes their are */
+    MPI_Bcast(&num_nodes, 1, MPI_UNSIGNED, 0, MPI_COMM_WORLD);
+
+    /* find start of file */
+    nodes = strstr(file, "ToNodeId");
+    nodes+=10;
+
+    unsigned int offset = (unsigned int)(nodes - file);
+    unsigned int eof = nbytes - offset;
+    printf("offset: %d eof: %d\n", offset, eof);
+    /* chop up and send to other processes */
+    nodes_per_proc = num_nodes / numprocs;
+
+    printf("num_nodes: %d per_proc: %d\n", num_nodes, nodes_per_proc);
+
+    unsigned int nodes_sent,last_sent,receiver,connections,j;
+    nodes_sent = 0; connections = 0; receiver = 0;
+
+    connect_to.resize(nodes_per_proc);
+
+    last_sent = 0; i=0; start = 0;
+    while (i < eof && nodes[i] != '\0') {
+        unsigned int line[2];
+        start = i;
+        i = get_lines(nodes, i, line);
+        // printf("last sent: %d line[0]: %d i: %ld\n", last_sent, line[0], i);
+        /* check to see if this is a new node */
+        if (last_sent != line[0] || i >= eof) {
+            printf("last_sent: %d line[0]: %d line[1]: %d "
+                   "connections: %d sent: %d receiver: %d start: %d i: %ld\n",
+                   last_sent,
+                   line[0], line[1],
+                   connections,
+                   nodes_sent, receiver, start, i);
+            /* if this is meant for proc0 allocate the memory needed
+             * else send the data to the appropriate proc
+             */
+            // if (i >= eof) connections++;
+
+            if (receiver == 0) {
+                add_connections(connections, start, nodes_sent, nodes);
+            }
+            else {
+                send_data.push_back(connections);
+                for (j=0; j<connections; j++) {
+                    unsigned int tmp_line[2];
+                    start = get_lines(nodes, start, tmp_line);
+                    printf("\tfor: %d tnodes_sent: %d j: %d nodes[%d]: %d\n",
+                           receiver,nodes_sent,j,start,line[1]);
+                    send_data.push_back(tmp_line[1]);
+                }
+
+                connections += 1;
+                // printf("SENDING: %d to %d sent: %d\n",
+                       // connections,receiver,nodes_sent);
+                MPI_Send(&connections, 1, MPI_UNSIGNED, receiver,
+                         0, MPI_COMM_WORLD);
+                unsigned int data[connections];
+                unsigned int k=0;
+
+                for (k=0; k<connections; k++)
+                    data[k] = send_data.at(k);
+
+                send_data.clear();
+                printf("SENDING: data to %d\n", receiver);
+                MPI_Send(data, connections, MPI_INT,
+                         receiver, 0, MPI_COMM_WORLD);
+            }
+            last_sent = line[0];
+            connections = 0;
+            nodes_sent++;
+
+            if (nodes_sent == nodes_per_proc) {
+                receiver++;
+                nodes_sent = 0;
+            }
+        }
+        connections++;
+    }
+
+    if (receiver < (unsigned int)numprocs) {
+        if (receiver != 0) {
+            unsigned int eot = num_nodes+1;
+            /* send an EOT just in case someone is left waiting */
+            MPI_Send(&eot, 1, MPI_UNSIGNED, receiver, 0, MPI_COMM_WORLD);
+        }
+        else {
+            printf("start: %d %ld\n", start, i);
+            add_connections(connections, start, nodes_sent, nodes);
+        }
+    }
+
+    close(fd);
+    free(file);
+}
+
+inline int get_lines(char * nodes, long start, unsigned int line[2]) {
+    char buf[100];
+    int i=0;
+    while (nodes[start] != '\r')
+        buf[i++] = nodes[start++];
+    buf[i] = '\0';
+
+    char *iptr;
+    iptr = strtok(buf, "\t");
+    line[0] = atoi(iptr);
+    iptr = strtok(NULL, "\r");
+    line[1] = atoi(iptr);
+
+    return start+2;
+}
+
+inline void add_connections(unsigned int connections, int start,
+                            unsigned int nodes_sent, char *nodes) {
+    connect_to[nodes_sent].push_back(connections);
+    unsigned int j;
+    for (j=0; j<connections; j++) {
+        unsigned int tmp_line[2];
+        start = get_lines(nodes, start, tmp_line);
+        printf("\tnodes_sent: %d j: %d start: %d, "
+               "line[0]: %d line[1]: %d\n",
+               nodes_sent, j, start, tmp_line[0], tmp_line[1]);
+        connect_to[nodes_sent].push_back(tmp_line[1]);
+    }
+}
+
+void print_arrays(int rank, unsigned int nodes_per_proc) {
+    unsigned int i,j;
+    for (i=0; i<nodes_per_proc; i++) {
+        printf("%d: [", i + (rank * nodes_per_proc));
+        for (j=0;j<connect_to[i][0]+1; j++) {
+            printf(" %d", connect_to[i][j]);
+        }
+        printf("]::%d::%d\n", rank, i + (rank*nodes_per_proc));
+    }
+}

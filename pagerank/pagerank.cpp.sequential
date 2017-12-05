@@ -1,0 +1,283 @@
+#include <unistd.h>
+#include <fcntl.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <mpi.h>
+#include <math.h>
+
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include <vector>
+#include <string>
+#include <iostream>
+#include <map>
+#include <utility>
+
+using namespace std;
+
+
+void read_data(int, int, char**);
+void get_line(char *, unsigned int[]);
+void compute_rank(map<int, vector<unsigned int> > &, double[], vector<unsigned int> &);
+double two_norm(double[]);
+void distribute_data(map<int, vector<unsigned int> > &, vector<unsigned int> &, unsigned int);
+    
+template<typename T> void print_vector2(vector<T> &, const char *);
+template<typename T> void print_vector(vector<T> &, const char *);
+template<typename T> void print_array(T[], const char *, unsigned int);
+void print_map(map<int, vector<unsigned int> > &, const char *);
+
+unsigned int num_nodes, nodes_per_proc;
+
+vector< vector <unsigned int> > connect_to;
+vector <unsigned int> send_data;
+vector <unsigned int> num_out;
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        printf("Usage: mpirun -machinefile <filename>"
+               "-np <# of procs> <name of input file>\n");
+        return 1;
+    }
+
+    int numprocs, rank;
+
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    /* parse the input file and get the initial data to everyone */
+    if (rank == 0) {
+        read_data(numprocs, rank, argv);
+    }
+
+    // generate the list of 'who is connected to me'
+    map<int, vector<unsigned int> >to_me;
+
+    for (unsigned int i=0; i<num_nodes; i++) {
+        num_out.push_back(connect_to[i].size());
+        for (unsigned int j=0; j<connect_to[i].size(); j++) {
+            // didnt find node
+            to_me[connect_to[i][j]].push_back(i);
+        }
+    }
+
+    // give the data to the other nodes
+    // if (rank == 0) 
+    //     distribute_data(to_me, num_out, num_nodes);
+    // else
+    //     receive_data();
+    
+    double rank_vector[nodes_per_proc];
+    double initial_rank = 1 / (double)num_nodes;
+    for (unsigned int i=0; i<nodes_per_proc; i++)
+        rank_vector[i] = initial_rank;
+    
+    // check connect_to
+    print_vector2(connect_to, "connect_to");
+    // check to_me
+    print_map(to_me, "to_me");
+    // check num_out
+    print_vector(num_out, "num_out");
+    // check rank_vector
+    print_array(rank_vector, "rank_vector", num_nodes);
+    
+    compute_rank(to_me, rank_vector, num_out);
+
+    printf("FIN::%d\n",rank);
+    MPI_Finalize();
+
+    return 0;
+}
+void distribute_data(map<int, vector<unsigned int> > &to_me, double rank_vector[],
+                     vector<unsigned int> &num_out, unsigned int num_nodes) {
+    // send out the number of nodes to everyone
+}
+
+/* read the file
+ * chop it into chunnks
+ * send to the rest of the processors
+ */
+void read_data(int numprocs, int rank, char *argv[]) {
+    int fd=0;
+    if ((fd=open(argv[1], O_RDONLY)) < 0) {
+        printf("Error in opening the file!\n");
+        exit(1);
+    }
+    struct stat fileStat;
+    if (fstat(fd, &fileStat) < 0) {
+        printf("Error getting fstat!\n");
+        exit(1);
+    }
+    long i;
+    long nbytes = fileStat.st_size;
+    char *file = (char *)malloc(sizeof(char) * nbytes);
+
+    read(fd, file, nbytes);
+
+    /* get the number of nodes in this graph */
+    char *nodes;
+    nodes = strstr(file, "Nodes: ");
+    nodes+=7;
+
+    int start=0;
+    i=0;
+    while (nodes[i++] != ' ') start++;
+    string num_nodes_str(nodes, start);
+    // cout << "num_nodes: [" << num_nodes_str << "]\n";
+    num_nodes = atoi(num_nodes_str.c_str());
+
+    /* tell everyone how many nodes their are */
+    // MPI_Bcast(&num_nodes, 1, MPI_UNSIGNED, 0, MPI_COMM_WORLD);
+
+    /* find start of file */
+    nodes = strstr(file, "ToNodeId");
+    nodes+=10;
+
+    /* chop up and send to other processes */
+    nodes_per_proc = num_nodes / numprocs;
+
+    printf("num_nodes: %d per_proc: %d\n", num_nodes, nodes_per_proc);
+
+    unsigned int nodes_sent,last_sent,receiver,connections,real_nnodes;
+    nodes_sent = 0; connections = 0; receiver = 0; last_sent = 0; real_nnodes = 0;
+
+    connect_to.resize(nodes_per_proc);
+
+    char *line;
+    unsigned int line_nums[2];
+
+    line = strtok(nodes, "\n");
+    while (line != NULL) {
+        // do work on line
+        // get the contents of this line
+        get_line(line, line_nums);
+        // printf("%s\n", line);
+            // printf("[0]: %d [1]: %d\n", line_nums[0], line_nums[1]);
+
+        if (last_sent == line_nums[0]) {
+            // printf("pushing: %d <- %d\n", nodes_sent, line_nums[1]);
+            connect_to[nodes_sent].push_back(line_nums[1]);
+        }
+        else {
+            // printf("pushing: %d <- %d\n", nodes_sent+1, line_nums[1]);
+            connect_to[++nodes_sent].push_back(line_nums[1]);
+            last_sent = line_nums[0];
+            real_nnodes++;
+        }
+        // move to next line
+        line = strtok(NULL, "\n");
+    }
+
+    num_nodes = ++real_nnodes;
+    nodes_per_proc = num_nodes / numprocs;
+
+    connect_to.resize(nodes_per_proc);
+    printf("real: %d\n", real_nnodes);
+
+    close(fd);
+    free(file);
+}
+
+inline void get_line(char *line, unsigned int line_nums[2]) {
+    char buf[100];
+    int i=0, start=0;
+    while (line[start] != '\t')
+        buf[i++] = line[start++];
+    buf[i] = '\0';
+    line_nums[0] = atoi(buf);
+
+    i=0;
+    while (line[start] != '\r')
+        buf[i++] = line[start++];
+    buf[i] = '\0';
+    line_nums[1] = atoi(buf);
+    // printf("line0: %d line1: %d\n", line[0], line[1]);
+}
+
+void compute_rank(map<int, vector<unsigned int> > &to_me, double rank_vector[],
+                  vector<unsigned int> &num_out) {
+    double tmp_rank[nodes_per_proc];
+    double norm2_new = 1.0, norm2_prev, diff = 1.0;
+    norm2_prev = two_norm(rank_vector);
+    printf("prev: %f\n", norm2_prev);
+
+    int i=10000;
+    // while (diff > 0.01) {
+    while (i > 0) {
+        // go through the map and add the approriate elements from the vector
+        for (map<int, vector<unsigned int> >::iterator mi=to_me.begin();
+             mi!=to_me.end(); ++mi) {
+            tmp_rank[mi->first] = 0;
+            for (vector<unsigned int>::iterator vi=mi->second.begin();
+                 vi!=mi->second.end(); ++vi) {
+                tmp_rank[mi->first] += (rank_vector[(*vi)] / num_out[(*vi)]);
+            }
+            // printf("%d: %d\n",mi->first, tmp_rank[mi->first]);
+        }
+
+        for (map<int, vector<unsigned int> >::iterator mi=to_me.begin();
+             mi!=to_me.end(); ++mi) {
+            rank_vector[mi->first] = tmp_rank[mi->first];
+        }
+
+        norm2_new = two_norm(rank_vector);
+        diff = norm2_new - norm2_prev;
+        norm2_prev = norm2_new;
+        i--;
+    }
+    printf("new: %f prev: %f diff: %f\n", norm2_new, norm2_prev, diff);
+    print_array(rank_vector, "rank_vector", num_nodes);
+}
+
+double two_norm(double rank_vector[]) {
+    double sum = 0;
+    for (unsigned int i=0; i<nodes_per_proc; i++)
+        sum += pow((float)rank_vector[i], 2);
+
+    return sqrt(sum);
+}
+
+template<typename T> void print_vector2(vector<T> &vect, const char *name) {
+    int i=0;
+    char buf[50];
+    
+    cout << name << " =" << endl;
+    for (typename vector<T>::iterator vi=vect.begin();
+         vi!=vect.end(); ++vi) {
+        sprintf(buf, "%d", i++);
+        print_vector((*vi), buf);
+    }
+    
+}
+void print_map(map<int, vector<unsigned int> > &to_me, const char *name) {
+    cout << name << " = [" << endl;
+    for (map<int, vector<unsigned int> >::iterator mi=to_me.begin();
+         mi!=to_me.end(); ++mi) {
+        cout << (*mi).first << " : ";
+        for (vector<unsigned int>::iterator vi=mi->second.begin();
+             vi!=mi->second.end(); ++vi) {
+            cout << *vi << " ";
+        }
+        cout << endl;
+    }
+    cout << "]" << endl;
+}
+
+template<typename T> void print_vector(vector<T> &vect, const char *name) {
+    cout << name << " = [";
+    for (vector<unsigned int>::iterator vi=vect.begin();
+         vi!=vect.end(); ++vi) {
+        cout << (*vi) << ", ";
+    }
+    cout << "]" << endl;
+}
+
+template<typename T> void print_array(T arr[], const char *name, unsigned int length) {
+    cout << name << " = [";
+    for (unsigned int i=0; i<length; i++)
+        cout << arr[i] << ", ";
+    cout << "]" << endl;
+}

@@ -1,0 +1,23 @@
+reducer.cpp/hpp:
+These are the core code of the reducers (obviously).
+
+To compile:
+   mpic++ -Wall -std=c++0x reducer.cpp -o reducer
+To run:
+   mpirun --machinefile machines -np <num_procs> reducer <input_file>
+
+maketables.py: This is used to create tables. This will take as input the
+	       number of processors and the size of the table per processor.
+
+
+***As a note: tables sizes (per processor) around 100K seem to be haiving
+***problems. All table sizes used for testing were 50K per proc.***
+
+test.py: This takes as input a file and computes the reduction. This
+	  was used to check the accuracy of the MPI results.
+
+results.txt: These are the results of testing by processor size with tables
+	     of the same size.
+
+tests/:	This directory contains the test files used.
+results.pdf: A chart of the results.

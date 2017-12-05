@@ -1,0 +1,5 @@
+BUGS: Either some graphs aren't fully connected or my implementation is wrong.
+      It appears from many sources lots of nodes don't get added to the
+      network.
+
+To execute: make run F=<input_file> O=<output_file> S=<source> T=<#threads>

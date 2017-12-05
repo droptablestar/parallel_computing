@@ -1,0 +1,530 @@
+#include <unistd.h>
+#include <fcntl.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <mpi.h>
+
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include <string>
+#include <iostream>
+#include <utility>
+#include <set>
+#include <cmath>
+
+#include "debug.cpp"
+
+using namespace std;
+
+#define round(x) floor(x+0.5);
+const double damp = 0.85;
+
+void read_data(int, int, char**);
+void get_line(char *, uint[]);
+void compute_rank(map<uint, vector<uint> > &, double[], vector<double> &, int, int);
+double two_norm(double[]);
+void distribute_data(map<uint, vector<uint> > &, vector<double> &, int);
+void receive_data(int, int);
+bool fncomp(uint lhs, uint rhs) {return lhs<rhs;}
+void compute_bounds(uint *, uint *, uint, uint);
+void get_receive_v(map<uint, vector<uint> > &, set<uint, bool(*)(uint,uint)> &,
+                   uint, uint, int, double[]);
+void get_rcv_m(set<uint, bool(*)(uint,uint)> &, map<uint, vector<uint> > &,
+                int);
+
+void distribute_recv_m(map<uint, vector<uint> > &, map<uint, vector<uint> > &,
+                       int, int);
+int idx2id(int, uint, int);
+void exchange_ranks(double[], int, int, map<uint, vector<uint> >,
+                    map<uint, vector<uint> >);
+
+uint num_nodes, nodes_per_proc;
+
+
+// kluge alert
+int EOT[2] = {-1, -1};
+
+// adjacency matrix
+vector< vector <uint> > connect_to;
+
+// the number of nodes that come out of this node
+vector <double> num_out;
+
+// generate the list of 'who is connected to me'
+map<uint, vector<uint> >to_me;
+
+double nrm;
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        printf("Usage: mpirun -machinefile <filename>"
+               "-np <# of procs> <name of input file>\n");
+        return 1;
+    }
+
+    int numprocs, rank;
+
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    /* parse the input file and get the initial data to everyone */
+    if (rank == 0) {
+        read_data(numprocs, rank, argv);
+        for (uint i=0; i<num_nodes; i++) {
+            num_out.push_back(1.0/connect_to[i].size());
+            for (uint j=0; j<connect_to[i].size(); j++) {
+                to_me[connect_to[i][j]].push_back(i);
+            }
+        }
+        // give the data to the other nodes
+        if (numprocs > 1)
+            distribute_data(to_me, num_out, numprocs);
+    }
+    else
+        receive_data(numprocs, rank);
+
+    nrm = (1 - damp) / num_nodes;
+    // printf("P%d: norm: %f damp: %f\n", rank, nrm, damp);
+    // printf("p%d nodes: %d per_proc: %d\n", rank, num_nodes, nodes_per_proc);
+    double rank_vector[nodes_per_proc];
+    double initial_rank = 1 / (double)num_nodes;
+    for (uint i=0; i<num_nodes; i++)
+        rank_vector[i] = initial_rank;
+
+    // printf("p%d nodes_per: %d\n", rank, nodes_per_proc);
+    // check connect_to
+    // if (rank == 0)
+    //     print_vector2(connect_to, "connect_to");
+    // check to_me
+    printf("p%d: ", rank);
+    print_map(to_me, "to_me");
+    // check num_out
+    printf("p%d: ", rank);
+    print_vector(num_out, "num_out");
+
+    compute_rank(to_me, rank_vector, num_out, rank, numprocs);
+
+    printf("FIN::%d\n",rank);
+    MPI_Finalize();
+
+    return 0;
+}
+
+void compute_rank(map<uint, vector<uint> > &to_me, double rank_vector[],
+                  vector<double> &num_out, int rank, int numprocs) {
+    bool(*fn_ptr)(uint, uint) = fncomp;
+    // this contains all the indices inside the rank_vector this proc needs
+    set<uint, bool(*)(uint,uint)> receive_v (fn_ptr);
+    // this contains the elements each proc needs by rank
+    map<uint, vector<uint> > rcv_m, snd_m;
+
+    // this is all preprocessing
+    uint lower, upper;
+    compute_bounds(&lower, &upper, rank, numprocs);
+    get_receive_v(to_me, receive_v, lower, upper, rank, rank_vector);
+    get_rcv_m(receive_v, rcv_m, numprocs);
+    distribute_recv_m(rcv_m, snd_m, numprocs, rank);
+
+    printf("P%d: lower: %d upper: %d \n", rank, lower, upper);
+    double tmp_rank[nodes_per_proc];
+    double norm2_new = 1.0, norm2_prev, diff = 1.0;
+    norm2_prev = two_norm(rank_vector);
+
+    // printf("p%d new: %f prev: %f diff: %f\n", rank, norm2_new, norm2_prev, diff);
+    vector<uint>::iterator vi;
+    // int i=10;
+    // while (i > 0) {
+    while (diff > 0.00001) {
+        for (uint r=lower; r<upper; r++) {
+            // this has incoming connections
+            if (to_me.find(r) != to_me.end()) {
+                tmp_rank[r] = 0;
+                printf("p%d: ", rank);
+                for (vi=to_me.at(r).begin(); vi!=to_me.at(r).end(); ++vi) {
+                    int idx = idx2id(rank, *vi, numprocs);
+                    printf("(%f * %f) + ", rank_vector[*vi], num_out[idx]);
+                    tmp_rank[r] += (rank_vector[*vi] * num_out[idx]);
+                }
+                tmp_rank[r] = nrm + damp * tmp_rank[r];
+                printf("\b\b = %f\n", tmp_rank[r]);
+            }
+            else
+                tmp_rank[r] = nrm;
+                
+        }
+        for (uint r=lower; r<upper; ++r)
+            rank_vector[r] = tmp_rank[r];
+
+        // printf("p%d: ", rank);
+        // print_array(rank_vector, "rank_vector", num_nodes);
+        MPI_Barrier(MPI_COMM_WORLD);
+        exchange_ranks(rank_vector, rank, numprocs, snd_m, rcv_m);
+    
+        norm2_new = two_norm(rank_vector);
+        diff = abs(norm2_new - norm2_prev);
+        printf("p%d new: %f prev: %f diff: %f\n", rank, norm2_new, norm2_prev, diff);
+        printf("p%d: ", rank);
+        print_array(rank_vector, "rank_vector", num_nodes);
+        norm2_prev = norm2_new;
+        // i--;
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+void exchange_ranks(double rank_vector[], int rank, int numprocs,
+                    map<uint, vector<uint> >snd_m, map<uint, vector<uint> >rcv_m) {
+    MPI_Status status;
+    int size_out[numprocs][2], size_in[numprocs][2];
+    
+    for (int p=(rank+1)%numprocs; p!=rank; p=(p+1)%numprocs) {
+        if (snd_m.find(p) == snd_m.end()) {
+            EOT[1] = rank;
+            MPI_Send(&EOT, 2, MPI_INT, p, 0, MPI_COMM_WORLD);
+        }
+        else {
+            size_out[p][0] = snd_m[p].size(); size_out[p][1] = rank;
+            double data[size_out[p][0]];
+            for (int i=0; i<size_out[p][0]; i++) {
+                // printf("p%d sending: %f to %d\n",rank, rank_vector[snd_m[p].at(i)], p);
+                data[i] = rank_vector[snd_m[p].at(i)];
+            }
+            MPI_Send(size_out[p], 2, MPI_INT, p, 0, MPI_COMM_WORLD);
+            MPI_Send(data, size_out[p][0], MPI_DOUBLE, p,0,MPI_COMM_WORLD);
+        }
+        MPI_Recv(size_in[p], 2, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD,
+                 &status);
+        // printf("p%d received %d from %d\n", rank, size_in[p][0], size_in[p][1]);
+        if (size_in[p][0] != EOT[0]) {
+            double data[size_in[p][0]];
+            // printf("p%d receiving %d from %d\n",rank,size_in[p][0],size_in[p][1]);
+            MPI_Recv(data, size_in[p][0], MPI_DOUBLE, size_in[p][1], MPI_ANY_TAG,
+                     MPI_COMM_WORLD, &status);
+            int i=0;
+            for (vector<uint>::iterator vi=rcv_m[size_in[p][1]].begin();
+                 vi!=rcv_m[size_in[p][1]].end(); ++vi) {
+                // printf("p%d received %f putting it in: %d\n",
+                //        rank, data[i++], *vi);
+                rank_vector[*vi] = data[i++];
+            }
+        }
+    }
+}
+
+void distribute_recv_m(map<uint, vector<uint> > &rcv_m,
+                       map<uint, vector<uint> > &snd_m, int numprocs, int rank) {
+    MPI_Status status;
+    // printf("P%d: ", rank);
+    // print_map(rcv_m, "rcv_m");
+    int size_out[numprocs][2];
+    int size_in[numprocs][2];
+
+    for (int p=(rank+1)%numprocs; p!=rank; p=(p+1)%numprocs) {
+        if (rcv_m.find(p) == rcv_m.end()) {
+            EOT[1] = rank;
+            // printf("p%d sending %d to %d\n", rank, EOT[0], p);
+            MPI_Send(&EOT, 2, MPI_INT, p, 0, MPI_COMM_WORLD);
+        }
+        // this proc has data i need
+        else {
+            size_out[p][0] = rcv_m[p].size(); size_out[p][1] = rank;
+            // send size of vector, and vector
+            // printf("p%d sending %d to %d\n", rank, size_out[p][0], p);
+            MPI_Send(size_out[p], 2, MPI_INT, p, 0, MPI_COMM_WORLD);
+            // printf("p%d sending %d to %d\n", rank, size_out[p][0], p);
+            MPI_Send(&(rcv_m[p][0]), size_out[p][0], MPI_UNSIGNED, p,0,MPI_COMM_WORLD);
+        }
+        MPI_Recv(size_in[p], 2, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD,
+                 &status);
+        // printf("p%d received %d from %d\n", rank, size_in[p][0], size_in[p][1]);
+        if (size_in[p][0] != EOT[0]) {
+            uint data[size_in[p][0]];
+            // printf("p%d receiving %d from %d\n", rank, size_in[p][0], size_in[p][1]);
+            MPI_Recv(data, size_in[p][0], MPI_UNSIGNED, size_in[p][1], MPI_ANY_TAG,
+                     MPI_COMM_WORLD, &status);
+            for (uint i=0; i<(uint)size_in[p][0]; i++)
+                snd_m[size_in[p][1]].push_back(data[i]);
+        }
+    }
+    // printf("P%d: ", rank);
+    // print_map(snd_m, "snd_m");
+}
+
+void get_rcv_m(set<uint, bool(*)(uint,uint)> &receive_v,
+                map<uint, vector<uint> > &rcv_m, int numprocs) {
+    int i;
+    for (set<uint, bool(*)(uint,uint)>::iterator si=receive_v.begin();
+         si!=receive_v.end(); ++si) {
+        uint low, up;
+        for (i=0; i<numprocs; i++) {
+            compute_bounds(&low, &up, i, numprocs);
+            // printf("si: %d low: %d up: %d\n", *si, low, up);
+            // this node belongs to proc i
+            if ((*si) >= low && (*si) < up) 
+                 rcv_m[i].push_back(*si);
+         }
+    }
+}
+    
+void get_receive_v(map<uint, vector<uint> > &to_me, set<uint,
+                   bool(*)(uint,uint)> &receive_v, uint lower, uint upper,
+                   int rank, double rank_vector[]) {
+    for (map<uint, vector<uint> >::iterator mi=to_me.begin();
+         mi!=to_me.end(); ++mi) {
+        for (vector<uint>::iterator vi=mi->second.begin();
+             vi!=mi->second.end(); ++vi) {
+            if ((*vi) < lower || (*vi) >= upper) {
+                receive_v.insert(*vi);
+                // printf("p%d needs %d\n", rank, *vi);
+            }
+        }
+    }
+}
+
+void distribute_data(map<uint, vector<uint> > &to_me,
+                     vector<double> &num_out, int numprocs) {
+    // send out the number of nodes to everyone
+    int p=1;
+    MPI_Bcast(&num_nodes, 1, MPI_UNSIGNED, 0, MPI_COMM_WORLD);
+
+    map<uint, vector<uint> >::iterator mi;
+    p=0;
+    // send them the appropriate portion of to_me
+    for (mi=to_me.begin(); mi!=to_me.end(); ++mi) {
+        int size[2];
+        uint upper = p*nodes_per_proc + nodes_per_proc;
+        if (p == numprocs-1 && numprocs*nodes_per_proc < num_nodes) {
+            int nodes_per = num_nodes - (numprocs * nodes_per);
+            upper = p*nodes_per_proc + nodes_per;
+        }
+        // printf("first: %d >= %d < %d\n",
+        //        mi->first, p*nodes_per_proc, upper);
+        
+        if (mi->first >= p*nodes_per_proc && mi->first < upper) {
+            if (p == 0) continue;
+            // send size of to_me vector
+            size[0] = mi->second.size(); size[1] = mi->first;
+            // printf("sending: %d to %d\n", mi->first, p);
+            MPI_Send(&size, 2, MPI_INT, p, 0, MPI_COMM_WORLD);
+            // send portion of to_me vector
+            MPI_Send(&(mi->second[0]), size[0], MPI_UNSIGNED, p, 0,
+                     MPI_COMM_WORLD);
+            // send corresponding element in num_out
+            MPI_Send(&(num_out.at(mi->first)), 1, MPI_DOUBLE, p, 0,
+                       MPI_COMM_WORLD);
+        }
+        else {
+            // we're in the next bucket, so send this to the next proc
+            if (p != numprocs-1) {
+                // if the last proc wasn't the origin we have to EOT it
+                if (p != 0) {
+                    // printf("sending: %d to %d\n", EOT[0], p);
+                    MPI_Send(&EOT, 2, MPI_INT, p, 0, MPI_COMM_WORLD);
+                }
+                // send to_me to the next proc
+                int cond = !(mi->first >=p*nodes_per_proc && mi->first < upper);
+                while(cond) {
+                    p++;
+                    uint upper = p*nodes_per_proc + nodes_per_proc;
+                    if (p == numprocs-1)
+                        upper += num_nodes - (numprocs * nodes_per_proc);
+                    cond = !(mi->first >=p*nodes_per_proc && mi->first < upper);
+                    // this proc must have nothing
+                    if (cond)
+                        MPI_Send(&EOT, 2, MPI_INT, p, 0, MPI_COMM_WORLD);
+                    // safety condition!
+                    if (p>=numprocs) break;
+                }
+                size[0] = mi->second.size(); size[1] = mi->first;
+                // printf("FALL: sending: %d to %d\n", mi->first, p);
+
+                MPI_Send(&size, 2, MPI_INT, p, 0, MPI_COMM_WORLD);
+                MPI_Send(&(mi->second[0]), size[0], MPI_UNSIGNED, p, 0,
+                         MPI_COMM_WORLD);
+                // send corresponding element in num_out
+                MPI_Send(&(num_out.at(mi->first)), 1, MPI_DOUBLE, p, 0,
+                         MPI_COMM_WORLD);
+            }
+            else {
+                // send end of transmission
+                // printf("sending: %d to %d\n", EOT[0], p);
+                MPI_Send(&EOT, 2, MPI_INT, p, 0, MPI_COMM_WORLD);
+                p++;
+            }
+        }
+    }
+
+    // just in case we've left the last proc hanging...shouldnt happen, but
+    // c'est la vie
+    if (p < numprocs) {
+        // printf("OOPS: sending: %d to %d\n", EOT[0], p);
+        MPI_Send(&EOT, 2, MPI_INT, p, 0, MPI_COMM_WORLD);
+    }
+    for (mi=to_me.begin(); mi!=to_me.end(); ++mi) {
+        if (mi->first >= 0 + nodes_per_proc)
+            break;
+    }
+    to_me.erase(mi, to_me.end());
+}
+
+void receive_data(int numprocs, int rank) {
+    MPI_Status status;
+    MPI_Bcast(&num_nodes, 1, MPI_UNSIGNED, 0, MPI_COMM_WORLD);
+
+    nodes_per_proc = round((float)num_nodes / (uint)numprocs);
+    if (rank == numprocs-1 && numprocs*nodes_per_proc < num_nodes)
+        nodes_per_proc += num_nodes - (numprocs * nodes_per_proc);
+
+    // this is the size of the to_me vector
+    int size[2];
+    MPI_Recv(&size, 2, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+    // loop until end of tranmission is received
+    while(size[0] != EOT[0]) {
+        // read in the to_me vector to an array and then copy to this proc's
+        // to_me. no, i dont like this way of doing it.
+        uint data[size[0]];
+        MPI_Recv(&data, size[0], MPI_UNSIGNED, 0, MPI_ANY_TAG,
+                   MPI_COMM_WORLD, &status);
+        for (int i=0; i<size[0]; i++) to_me[size[1]].push_back(data[i]);
+
+        // receive the element of num_out
+        double out;
+        MPI_Recv(&out, 1, MPI_DOUBLE, 0, MPI_ANY_TAG, MPI_COMM_WORLD,
+                 &status);
+        num_out.push_back(out);
+        // get size of to_me vector (break on EOT)
+        MPI_Recv(&size, 2, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+    }
+}
+
+/* read the file
+ * chop it into chunnks
+ * send to the rest of the processors
+ */
+void read_data(int numprocs, int rank, char *argv[]) {
+    int fd=0;
+    if ((fd=open(argv[1], O_RDONLY)) < 0) {
+        printf("Error in opening the file!\n");
+        exit(1);
+    }
+    struct stat fileStat;
+    if (fstat(fd, &fileStat) < 0) {
+        printf("Error getting fstat!\n");
+        exit(1);
+    }
+    long i;
+    long nbytes = fileStat.st_size;
+    char *file = (char *)malloc(sizeof(char) * nbytes);
+
+    read(fd, file, nbytes);
+
+    /* get the number of nodes in this graph */
+    char *nodes;
+    nodes = strstr(file, "Nodes: ");
+    nodes+=7;
+
+    int start=0;
+    i=0;
+    while (nodes[i++] != ' ') start++;
+    string num_nodes_str(nodes, start);
+    // cout << "num_nodes: [" << num_nodes_str << "]\n";
+    num_nodes = atoi(num_nodes_str.c_str());
+
+    /* tell everyone how many nodes their are */
+    // MPI_Bcast(&num_nodes, 1, MPI_UNSIGNED, 0, MPI_COMM_WORLD);
+
+    /* find start of file */
+    nodes = strstr(file, "ToNodeId");
+    nodes+=10;
+
+    /* chop up and send to other processes */
+    // nodes_per_proc = num_nodes / numprocs;
+
+    // printf("num_nodes: %d per_proc: %d\n", num_nodes, nodes_per_proc);
+    // printf("num_nodes: %d\n", num_nodes);
+
+    uint nodes_sent,last_sent,receiver,connections,real_nnodes;
+    nodes_sent=0; connections=0; receiver=0; last_sent=0; real_nnodes=0;
+
+    connect_to.resize(num_nodes);
+
+    char *line;
+    uint line_nums[2];
+
+    line = strtok(nodes, "\n");
+    while (line != NULL) {
+        // do work on line
+        // get the contents of this line
+        get_line(line, line_nums);
+        // printf("%s\n", line);
+            // printf("[0]: %d [1]: %d\n", line_nums[0], line_nums[1]);
+
+        if (last_sent == line_nums[0]) {
+            // printf("pushing: %d <- %d\n", nodes_sent, line_nums[1]);
+            connect_to[nodes_sent].push_back(line_nums[1]);
+        }
+        else {
+            // printf("pushing: %d <- %d\n", nodes_sent+1, line_nums[1]);
+            connect_to[++nodes_sent].push_back(line_nums[1]);
+            last_sent = line_nums[0];
+            real_nnodes++;
+        }
+        // move to next line
+        line = strtok(NULL, "\n");
+    }
+
+    num_nodes = ++real_nnodes;
+    nodes_per_proc = round((float)num_nodes / numprocs);
+
+    connect_to.resize(num_nodes);
+    // printf("real: %d\n", real_nnodes);
+
+    close(fd);
+    free(file);
+}
+
+inline void get_line(char *line, uint line_nums[2]) {
+    char buf[100];
+    int i=0, start=0;
+    while (line[start] != '\t')
+        buf[i++] = line[start++];
+    buf[i] = '\0';
+    line_nums[0] = atoi(buf);
+
+    i=0;
+    while (line[start] != '\r')
+        buf[i++] = line[start++];
+    buf[i] = '\0';
+    line_nums[1] = atoi(buf);
+    // printf("line0: %d line1: %d\n", line[0], line[1]);
+}
+
+
+double two_norm(double rank_vector[]) {
+    double sum = 0;
+    for (uint i=0; i<nodes_per_proc; i++)
+        sum += pow((float)rank_vector[i], 2);
+
+    return sqrt(sum);
+}
+
+void compute_bounds(uint *lower, uint *upper, uint rank, uint numprocs) {
+    int nodes_per;
+    if (rank == numprocs-1) {
+        nodes_per = nodes_per_proc + num_nodes - (numprocs * nodes_per_proc);
+        (*lower) = rank * round((float)num_nodes / numprocs);
+        (*upper) = (*lower) + nodes_per;
+    }
+    else {
+        nodes_per = round((float)num_nodes / numprocs);
+        (*lower) = rank * nodes_per;;
+        (*upper) = (*lower) + nodes_per;
+    }
+}
+
+int idx2id(int rank, uint node_id, int numprocs) {
+    uint nodes_per = round((float)num_nodes / numprocs);
+    return node_id - (rank * nodes_per);
+}

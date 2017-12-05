@@ -1,0 +1,11 @@
+berkley 16
+highest rank: 0.009426 node id: 271009
+serial time: 253.417190 parallel time: 34.376000
+
+google 16
+highest rank: 0.000992 node id: 123517
+serial time: 81.237591 parallel time: 113.985734
+
+notre dame 16
+highest rank: 0.013170 node id: 0
+serial time: 34.867716 parallel time: 18.449066
